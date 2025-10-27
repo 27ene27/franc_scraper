@@ -2,6 +2,6 @@ Flask
 gunicorn
 requests
 pandas
-beautifulsoup
+beautifulsoup4
 pdfplumber
 pdfminer.six
