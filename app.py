@@ -53,7 +53,7 @@ BASE_HEADERS = {
 }
 
 # --- Runtime guards / sane defaults ---
-MAX_DEFAULT_KEYWORDS = int(os.environ.get('MAX_DEFAULT_KEYWORDS', '50'))  # cap default list
+MAX_DEFAULT_KEYWORDS = int(os.environ.get('MAX_DEFAULT_KEYWORDS', '20'))  # cap default list
 SEARCH_TIMEOUT = (10, 25)   # (connect, read)
 DOC_TIMEOUT    = (10, 35)
 
