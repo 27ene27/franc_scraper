@@ -28,6 +28,7 @@ from urllib3.util.retry import Retry
 from flask import Flask, request, Response, send_file, redirect
 import pandas as pd
 from bs4 import BeautifulSoup
+import threading
 
 try:
     import pdfplumber  # heavy, but works on Render
@@ -228,7 +229,17 @@ def search_keyword(session: requests.Session, kw: str, city: str, qarku: str = "
     rows = parse_rows_from_response(r.text, r.headers.get('Content-Type',''))
     return normalize_dataframe(rows, kw)
 
-
+def start_keepalive():
+    """Ping the Render app every ~13 minutes to keep it awake."""
+    def _loop():
+        while True:
+            try:
+                requests.get("https://franc-scraper.onrender.com/", timeout=10)
+            except Exception:
+                pass
+            time.sleep(13 * 60)  # 13 minutes
+    t = threading.Thread(target=_loop, daemon=True)
+    t.start()
 
 def extract_contacts_for_nipt(session: requests.Session, nipt: str) -> Tuple[str, str]:
     if not nipt:
@@ -495,5 +506,5 @@ def debug_raw():
     return Response(f"CT={ct}\n\n{txt}", mimetype="text/plain")
 
 if __name__ == "__main__":
-    # Local dev
+    start_keepalive()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8000")), debug=True)
