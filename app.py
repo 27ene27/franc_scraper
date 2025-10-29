@@ -21,9 +21,10 @@ import pathlib
 import tempfile
 from datetime import datetime
 from typing import List, Tuple, Dict, Any
-
+import shutil
 import requests
-from requests.adapters import HTTPAdapter, Retry
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from flask import Flask, request, Response, send_file, redirect
 import pandas as pd
 from bs4 import BeautifulSoup
@@ -48,11 +49,16 @@ BASE_HEADERS = {
     "Origin": "https://format.qkb.gov.al",
     "Referer": "https://format.qkb.gov.al/kerko-per-subjekt/",
     "X-Requested-With": "XMLHttpRequest",
-    "User-Agent": "Mozilla/5.0 (compatible; QKB-Scraper/1.0; +https://abissnet.cloud)",
 }
 
+# --- Runtime guards / sane defaults ---
+MAX_DEFAULT_KEYWORDS = int(os.environ.get('MAX_DEFAULT_KEYWORDS', '10'))  # cap default list
+SEARCH_TIMEOUT = (10, 25)   # (connect, read)
+DOC_TIMEOUT    = (10, 35)
+
+
 # Robust regex for JSON.parse("...") pattern used by the site
-JSON_PARSE_RX = re.compile(r'JSON\\.parse\\(\\s*([\"\'])([\\s\\S]*?)\\1\\s*\\)')
+JSON_PARSE_RX = re.compile(r'response\s*=\s*JSON\.parse\(\s*(["\'])([\s\S]*?)\1\s*\)')
 
 KEYWORDS = [
     # Gaming / PlayStation / LAN
@@ -125,6 +131,9 @@ KEYWORDS = [
     "server maintenance contract", "managed voip services",
 ]
 
+RE_EMAIL = re.compile(r"(?i)\b(?:e\s*[-–—]?\s*mail|email)\s*:?\s*([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})")
+RE_PHONE = re.compile(r"(?i)\b(?:telefon|tel)\s*:?\s*([+()\d][0-9 +()\-]{6,})")
+
 app = Flask(__name__)
 
 def make_session() -> requests.Session:
@@ -137,23 +146,41 @@ def make_session() -> requests.Session:
 def _split_people(s: str) -> List[str]:
     return [x.strip() for x in (s or "").split(";") if x.strip()]
 
-def parse_rows_from_response(html_text: str) -> List[Dict[str, Any]]:
+
+def parse_rows_from_response(html_text: str, content_type: str = "") -> List[Dict[str, Any]]:
     """
-    The QKB endpoint returns HTML with a JS 'JSON.parse("...")'. Extract safely, unescape and loads.
+    Try multiple response shapes:
+    1) Direct JSON (array or object)
+    2) HTML with JS: JSON.parse("...")
     """
-    m = JSON_PARSE_RX.search(html_text or "")
-    if not m:
-        raise RuntimeError("Embedded JSON not found via JSON.parse(...)")
-    quote = m.group(1)
-    inner = m.group(2)
-    # Convert JS string literal -> Python string (unescape) using ast.literal_eval on a quoted string
-    json_text = ast.literal_eval(quote + inner + quote)
-    rows = json.loads(json_text)
-    # normalize a few fields
-    for r in rows:
-        r["registered_at"] = (r.get("dataERegjistrimit") or "").replace("\\/", "/")
-        r["owners"] = _split_people(r.get("adminOrtakAksionar"))
-    return rows
+    raw = (html_text or "").strip()
+
+    # 1) Direct JSON
+    if raw.startswith("{") or raw.startswith("[") or content_type.lower().startswith("application/json"):
+        try:
+            obj = json.loads(raw)
+            # DataTables-style wrappers
+            if isinstance(obj, dict):
+                for k in ("data", "rows", "aaData", "results"):
+                    if k in obj and isinstance(obj[k], list):
+                        return obj[k]
+                # If dict itself is a row, wrap
+                return [obj] if obj else []
+            elif isinstance(obj, list):
+                return obj
+        except Exception as _:
+            pass
+
+    # 2) Embedded JSON.parse("...")
+    m = JSON_PARSE_RX.search(raw or "")
+    if m:
+        quote = m.group(1); inner = m.group(2)
+        json_text = ast.literal_eval(quote + inner + quote)
+        rows = json.loads(json_text)
+        return rows if isinstance(rows, list) else []
+
+    raise RuntimeError("QKB: unexpected search response (no JSON / JSON.parse)")
+
 
 def normalize_dataframe(rows: List[Dict[str, Any]], keyword: str) -> pd.DataFrame:
     df = pd.DataFrame(rows)
@@ -196,37 +223,66 @@ def search_keyword(session: requests.Session, kw: str, city: str, qarku: str = "
         "qyteti": city,
         "adresa": "",
     }
-    r = session.post(SEARCH_URL, data=payload, timeout=40)
+    r = session.post(SEARCH_URL, data=payload, timeout=SEARCH_TIMEOUT)
     r.raise_for_status()
-    rows = parse_rows_from_response(r.text)
+    rows = parse_rows_from_response(r.text, r.headers.get('Content-Type',''))
     return normalize_dataframe(rows, kw)
 
+
+
 def extract_contacts_for_nipt(session: requests.Session, nipt: str) -> Tuple[str, str]:
-    """
-    Downloads the 'simple' PDF for a NIPT and tries to extract E-mail and Telefon from the text.
-    Returns (email, phone) — any may be None if not found.
-    """
     if not nipt:
         return (None, None)
     try:
         payload = {"nipt": nipt, "docType": "simple"}
-        r = session.post(DOC_URL, data=payload, timeout=60)
+        r = session.post(DOC_URL, data=payload, timeout=DOC_TIMEOUT)
         r.raise_for_status()
+
+        # handle JSON even if CT is text/html
         data = r.json() if r.headers.get("Content-Type","").startswith("application/json") else json.loads(r.text)
-        pdf_bytes = base64.b64decode(data.get("data",""))
-        # parse PDF text
+        pdf_b64 = data.get("data")
+        if not pdf_b64:
+            return (None, None)
+
+        pdf_bytes = base64.b64decode(pdf_b64)
+
+        # Write to temp file like your notebook (pdfplumber is happiest with files)
+        with tempfile.NamedTemporaryFile(prefix="qkb_", suffix=".pdf", delete=False) as tmp:
+            tmp.write(pdf_bytes)
+            tmp_path = tmp.name
+
+        text_chunks = []
         email, phone = None, None
+
         if pdfplumber:
-            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-                pages_text = []
+            with pdfplumber.open(tmp_path) as pdf:
                 for page in pdf.pages:
-                    pages_text.append(page.extract_text() or "")
-                combined = "\\n".join(pages_text)
-                # tolerant patterns
-                m_email = re.search(r"E-?mail\\s*:?\\s*([A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,})", combined, flags=re.I)
-                m_phone = re.search(r"Telefon\\s*:?\\s*([0-9 +()\\-]+)", combined, flags=re.I)
-                email = m_email.group(1).strip() if m_email else None
-                phone = m_phone.group(1).strip() if m_phone else None
+                    # normalize whitespace a bit (layout can be funky)
+                    t = page.extract_text() or ""
+                    t = " ".join(t.split())
+                    text_chunks.append(t)
+
+            combined = "\n".join(text_chunks)   # real newline, not "\\"+"n"
+            # Try whole doc
+            m_e = RE_EMAIL.search(combined)
+            m_p = RE_PHONE.search(combined)
+            email = (m_e.group(1).strip() if m_e else None)
+            phone = (m_p.group(1).strip() if m_p else None)
+
+            # if still nothing, try first page only (your notebook behavior)
+            if not email or not phone:
+                first = text_chunks[0] if text_chunks else ""
+                if not email:
+                    m_e = RE_EMAIL.search(first); email = (m_e.group(1).strip() if m_e else None)
+                if not phone:
+                    m_p = RE_PHONE.search(first); phone = (m_p.group(1).strip() if m_p else None)
+
+        # cleanup temp
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
         return (email, phone)
     except Exception:
         return (None, None)
@@ -250,12 +306,12 @@ def run_scrape(keywords: List[str], city: str, qarku: str, delay: float, contact
         # cap number of PDFs to avoid timeouts
         n = 0
         for nipt in df["nipt"].tolist():
-            if nipt and n < max_contacts:
-                e, p = extract_contacts_for_nipt(s, nipt)
-                emails.append(e); phones.append(p)
+            if pd.notna(nipt) and str(nipt).strip() and n < max_contacts:
+                e, p = extract_contacts_for_nipt(s, str(nipt).strip())
                 n += 1
             else:
-                emails.append(None); phones.append(None)
+                e, p = (None, None)
+            emails.append(e); phones.append(p)
         df["email"] = emails
         df["telefon"] = phones
     # save
@@ -264,7 +320,23 @@ def run_scrape(keywords: List[str], city: str, qarku: str, delay: float, contact
     fpath = os.path.join(EXPORT_DIR, fname)
     df.to_csv(fpath, index=False, encoding="utf-8")
     return df, fpath
-
+def clear_exports_dir() -> int:
+    """Delete everything inside EXPORT_DIR. Returns count of removed items."""
+    root = pathlib.Path(EXPORT_DIR).resolve()
+    if not root.is_dir():
+        return 0
+    deleted = 0
+    for p in root.iterdir():
+        try:
+            if p.is_file():
+                p.unlink()
+            elif p.is_dir():
+                shutil.rmtree(p)
+            deleted += 1
+        except Exception:
+            # ignore stubborn files; you can log here if you want
+            pass
+    return deleted
 def html_page(body: str) -> str:
     return f"""<!doctype html>
 <html lang="sq">
@@ -296,7 +368,7 @@ def html_page(body: str) -> str:
 
 @app.route("/", methods=["GET"])
 def index():
-    default_kw = ", ".join(KEYWORDS[:20]) + ", …"  # preview only
+    default_kw = ", ".join(KEYWORDS[:MAX_DEFAULT_KEYWORDS]) + ", …"  # preview only
     body = f"""
     <h1>QKB Lead Finder</h1>
     <p class="meta">Scrape subjekte në QKB sipas fjalëkyçeve në <code>sektori i veprimtarisë</code>. Default qyteti: <b>{DEFAULT_CITY}</b>.</p>
@@ -336,6 +408,13 @@ def index():
       </div>
       <button type="submit">Start</button>
     </form>
+    <form method="POST" action="/clear-exports"
+          onsubmit="return confirm('Do të fshihen TË GJITHA eksportet. Vazhdo?');"
+          style="margin-top:12px">
+      <button type="submit" style="background:#b00020;color:#fff;border:none;padding:8px 12px;border-radius:6px">
+        🧹 Fshi folderin exports
+      </button>
+    </form>    
     <div class="note">
       <b>Shënim:</b> Mos e tepro me kërkesa. Mbaj një delay ≥ 0.3s. PDF-të janë të rënda – limito <i>Maks. subjekte për kontakt</i>.
     </div>
@@ -355,7 +434,7 @@ def scrape():
     if raw_kw:
         kws = [k.strip() for k in raw_kw.splitlines() if k.strip()]
     else:
-        kws = KEYWORDS
+        kws = KEYWORDS[:MAX_DEFAULT_KEYWORDS]
 
     df, fpath = run_scrape(kws, city, qarku, delay, contacts, max_contacts)
     # optional global dedup by NIPT only (collapse multiple keywords per company)
@@ -386,6 +465,34 @@ def download():
     if not os.path.exists(fpath):
         return Response("not found", status=404)
     return send_file(fpath, as_attachment=True, download_name=os.path.basename(fpath), mimetype="text/csv")
+
+@app.route("/clear-exports", methods=["POST"])
+def clear_exports():
+    deleted = clear_exports_dir()
+    body = f"""
+    <h1>OK</h1>
+    <p class="ok">U fshinë <b>{deleted}</b> element(e) nga <code>{EXPORT_DIR}</code>.</p>
+    <p><a href="/">↩︎ Kthehu</a></p>
+    """
+    return html_page(body)
+    
+@app.route("/debug/raw", methods=["GET"])
+def debug_raw():
+    kw = request.args.get("kw", "gaming")
+    city = request.args.get("city", DEFAULT_CITY)
+    qarku = request.args.get("qarku", "")
+    s = make_session()
+    payload = {
+        "orderColumn": "0", "orderDir": "asc",
+        "nipt": "", "emriISubjektit": "", "emriTregtar": "", "formeLigjore": "",
+        "pronesia": "", "dataNga": "", "dataNe": "", "numriId": "",
+        "administrator": "", "aksionerOrtak": "",
+        "sektoriIVeprimtarise": kw, "qarku": qarku, "qyteti": city, "adresa": "",
+    }
+    r = s.post(SEARCH_URL, data=payload, timeout=SEARCH_TIMEOUT)
+    ct = r.headers.get("Content-Type", "")
+    txt = r.text[:4000]
+    return Response(f"CT={ct}\n\n{txt}", mimetype="text/plain")
 
 if __name__ == "__main__":
     # Local dev
