@@ -53,7 +53,7 @@ BASE_HEADERS = {
 }
 
 # --- Runtime guards / sane defaults ---
-MAX_DEFAULT_KEYWORDS = int(os.environ.get('MAX_DEFAULT_KEYWORDS', '10'))  # cap default list
+MAX_DEFAULT_KEYWORDS = int(os.environ.get('MAX_DEFAULT_KEYWORDS', '50'))  # cap default list
 SEARCH_TIMEOUT = (10, 25)   # (connect, read)
 DOC_TIMEOUT    = (10, 35)
 
@@ -228,18 +228,6 @@ def search_keyword(session: requests.Session, kw: str, city: str, qarku: str = "
     r.raise_for_status()
     rows = parse_rows_from_response(r.text, r.headers.get('Content-Type',''))
     return normalize_dataframe(rows, kw)
-
-def start_keepalive():
-    """Ping the Render app every ~13 minutes to keep it awake."""
-    def _loop():
-        while True:
-            try:
-                requests.get("https://franc-scraper.onrender.com/", timeout=10)
-            except Exception:
-                pass
-            time.sleep(13 * 60)  # 13 minutes
-    t = threading.Thread(target=_loop, daemon=True)
-    t.start()
 
 def extract_contacts_for_nipt(session: requests.Session, nipt: str) -> Tuple[str, str]:
     if not nipt:
@@ -504,7 +492,24 @@ def debug_raw():
     ct = r.headers.get("Content-Type", "")
     txt = r.text[:4000]
     return Response(f"CT={ct}\n\n{txt}", mimetype="text/plain")
+    
+def keep_alive():
+    """Keep the Render app awake by pinging itself every 13 minutes"""
+    time.sleep(30)
+    
+    # Replace with your actual Render URL
+    app_url = "https://franc-scraper.onrender.com/"
+    
+    while True:
+        try:
+            time.sleep(13 * 60)  # 13 minutes
+            response = requests.get(app_url, timeout=10)
+            print(f"Keep-alive ping: {response.status_code}")
+        except Exception as e:
+            print(f"Keep-alive error: {e}")
+    
+threading.Thread(target=keep_alive, daemon=True).start()
 
 if __name__ == "__main__":
-    start_keepalive()
+
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8000")), debug=True)
